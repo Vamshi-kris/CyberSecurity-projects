@@ -1,201 +1,202 @@
-import socket
+#!/usr/bin/env python3
+"""
+IP Range Scanner - Network Discovery Tool
+Demonstrates network host discovery using concurrent ICMP and socket probing.
+"""
+
+import argparse
 import concurrent.futures
-from flask import Flask, request, jsonify, render_template_string
+import ipaddress
+import platform
+import socket
+import subprocess
+import sys
+import time
+from typing import List, Tuple, Optional
 
-app = Flask(__name__)
+# Default configuration
+DEFAULT_THREADS = 50
+DEFAULT_TIMEOUT = 1.0  # seconds
+PROBE_PORTS = [80, 443, 22, 445, 135]
 
-# Common service names for well-known ports
-SERVICE_MAP = {
-    20: "FTP-data", 21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP",
-    53: "DNS", 80: "HTTP", 110: "POP3", 111: "RPCbind", 135: "MSRPC",
-    139: "NetBIOS-SSN", 143: "IMAP", 443: "HTTPS", 445: "Microsoft-DS",
-    993: "IMAPS", 995: "POP3S", 1723: "PPTP", 3306: "MySQL",
-    3389: "RDP", 5432: "PostgreSQL", 5900: "VNC", 6379: "Redis",
-    8080: "HTTP-Alt", 8443: "HTTPS-Alt"
-}
 
-def scan_port(ip, port, timeout=1.0):
-    """Attempt to connect to ip:port. Return (port, is_open, service)."""
+def parse_ip_targets(target_input: str) -> List[ipaddress.IPv4Address]:
+    """
+    Parses CIDR notation (192.168.1.0/24) or hyphenated ranges (192.168.1.1-192.168.1.30).
+    """
+    targets = []
+    target_input = target_input.strip()
+
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
+        # Case 1: Hyphenated range (e.g., 192.168.1.5-192.168.1.25)
+        if '-' in target_input:
+            parts = target_input.split('-')
+            if len(parts) != 2:
+                raise ValueError("Invalid range format. Use StartIP-EndIP.")
+            
+            start_str, end_str = parts[0].strip(), parts[1].strip()
+            start_ip = ipaddress.IPv4Address(start_str)
+            
+            # Allow short format (192.168.1.1-50) or full IP (192.168.1.1-192.168.1.50)
+            if '.' not in end_str:
+                network_prefix = str(start_ip).rsplit('.', 1)[0]
+                end_ip = ipaddress.IPv4Address(f"{network_prefix}.{end_str}")
+            else:
+                end_ip = ipaddress.IPv4Address(end_str)
+
+            if int(start_ip) > int(end_ip):
+                raise ValueError("Start IP must be less than or equal to End IP.")
+
+            curr = int(start_ip)
+            while curr <= int(end_ip):
+                targets.append(ipaddress.IPv4Address(curr))
+                curr += 1
+
+        # Case 2: CIDR notation or single host
+        else:
+            net = ipaddress.ip_network(target_input, strict=False)
+            # If network has host addresses (e.g., /24), scan hosts; if /32, scan that host
+            if net.num_addresses > 1:
+                targets = list(net.hosts())
+            else:
+                targets = [net.network_address]
+
+    except (ValueError, ipaddress.AddressValueError, ipaddress.NetmaskValueError) as e:
+        raise ValueError(f"IP Input Error: {str(e)}")
+
+    return targets
+
+
+def icmp_ping(ip: str, timeout: float) -> bool:
+    """
+    Executes a platform-appropriate ICMP echo request.
+    """
+    param_count = "-n" if platform.system().lower() == "windows" else "-c"
+    param_timeout = "-w" if platform.system().lower() == "windows" else "-W"
+    
+    # Windows timeout is in milliseconds; Unix is in seconds
+    timeout_val = str(int(timeout * 1000)) if platform.system().lower() == "windows" else str(int(max(1, timeout)))
+    
+    cmd = ["ping", param_count, "1", param_timeout, timeout_val, ip]
+    
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def tcp_fallback_check(ip: str, ports: List[int], timeout: float) -> Tuple[bool, Optional[int]]:
+    """
+    Probes standard TCP ports to detect active hosts blocking ICMP.
+    """
+    for port in ports:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
             result = sock.connect_ex((ip, port))
             if result == 0:
-                service = SERVICE_MAP.get(port, "Unknown")
-                return port, True, service
-    except Exception:
-        pass
-    return port, False, None
+                sock.close()
+                return True, port
+        except (socket.timeout, OSError):
+            pass
+        finally:
+            sock.close()
+    return False, None
 
-@app.route('/')
-def index():
-    # Simple HTML page embedded in the Flask app
-    return render_template_string(HTML_TEMPLATE)
 
-@app.route('/scan', methods=['POST'])
-def scan():
-    data = request.get_json()
-    ip = data.get('ip', '').strip()
-    start_port = data.get('start_port')
-    end_port = data.get('end_port')
+def probe_host(ip_obj: ipaddress.IPv4Address, timeout: float) -> dict:
+    """
+    Evaluates host status using ICMP first, falling back to TCP connect scan.
+    """
+    ip_str = str(ip_obj)
+    
+    # Step 1: Ping
+    if icmp_ping(ip_str, timeout):
+        return {"ip": ip_str, "status": "Active", "method": "ICMP Ping", "detail": "Echo Reply"}
+    
+    # Step 2: TCP Syn/Connect Probe fallback
+    is_open, port = tcp_fallback_check(ip_str, PROBE_PORTS, timeout)
+    if is_open:
+        return {"ip": ip_str, "status": "Active", "method": "TCP Probe", "detail": f"Port {port} Open"}
+    
+    return {"ip": ip_str, "status": "Inactive", "method": "None", "detail": "No response"}
 
-    # Validate input
-    if not ip:
-        return jsonify({'error': 'IP address is required'}), 400
+
+def run_scanner(targets: List[ipaddress.IPv4Address], max_workers: int, timeout: float):
+    """
+    Manages concurrent thread pool execution and reports live results.
+    """
+    print(f"\n[+] Starting scan on {len(targets)} host(s)...")
+    print(f"[+] Concurrency: {max_workers} threads | Timeout: {timeout}s\n")
+    print(f"{'IP Address':<18} | {'Status':<10} | {'Discovery Method':<18} | {'Details'}")
+    print("-" * 65)
+
+    active_hosts = []
+    inactive_hosts = []
+
+    start_time = time.time()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_ip = {executor.submit(probe_host, ip, timeout): ip for ip in targets}
+        for future in concurrent.futures.as_completed(future_to_ip):
+            try:
+                res = future.result()
+                if res["status"] == "Active":
+                    active_hosts.append(res)
+                    print(f"\033[92m{res['ip']:<18} | {res['status']:<10} | {res['method']:<18} | {res['detail']}\033[0m")
+                else:
+                    inactive_hosts.append(res)
+            except Exception as e:
+                ip = future_to_ip[future]
+                print(f"[!] Error scanning {ip}: {e}", file=sys.stderr)
+
+    elapsed = time.time() - start_time
+    
+    # Summary Output
+    print("-" * 65)
+    print(f"\n[+] Scan completed in {elapsed:.2f} seconds.")
+    print(f"[+] Total Scanned: {len(targets)}")
+    print(f"[+] Active Hosts : {len(active_hosts)}")
+    print(f"[+] Inactive Hosts: {len(inactive_hosts)}\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Network Security Discovery Scanner - Active Host Identification"
+    )
+    parser.add_argument(
+        "range",
+        help="Target IP range. Examples: 192.168.1.0/24 or 192.168.1.1-192.168.1.50"
+    )
+    parser.add_argument(
+        "-t", "--threads",
+        type=int,
+        default=DEFAULT_THREADS,
+        help=f"Number of concurrent scan threads (default: {DEFAULT_THREADS})"
+    )
+    parser.add_argument(
+        "-w", "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help=f"Response timeout per host in seconds (default: {DEFAULT_TIMEOUT})"
+    )
+
+    args = parser.parse_args()
+
     try:
-        start_port = int(start_port)
-        end_port = int(end_port)
-        if start_port < 1 or end_port > 65535 or start_port > end_port:
-            raise ValueError
-    except (TypeError, ValueError):
-        return jsonify({'error': 'Invalid port range'}), 400
+        targets = parse_ip_targets(args.range)
+        if not targets:
+            print("[!] No valid host addresses found in provided range.")
+            sys.exit(1)
+        run_scanner(targets, max_workers=args.threads, timeout=args.timeout)
+    except KeyboardInterrupt:
+        print("\n[!] Scan aborted by user.")
+        sys.exit(130)
+    except ValueError as err:
+        print(f"[!] Target error: {err}")
+        sys.exit(1)
 
-    # Validate IP format (basic check)
-    try:
-        socket.inet_aton(ip)
-    except socket.error:
-        return jsonify({'error': 'Invalid IP address format'}), 400
 
-    ports = range(start_port, end_port + 1)
-    results = []
-
-    # Use thread pool for faster scanning
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
-        future_to_port = {executor.submit(scan_port, ip, port): port for port in ports}
-        for future in concurrent.futures.as_completed(future_to_port):
-            port, is_open, service = future.result()
-            if is_open:
-                results.append({
-                    'port': port,
-                    'status': 'Open',
-                    'service': service
-                })
-            else:
-                results.append({
-                    'port': port,
-                    'status': 'Closed',
-                    'service': ''
-                })
-
-    # Sort results by port number
-    results.sort(key=lambda x: x['port'])
-    return jsonify({'results': results})
-
-# HTML template (embedded as a string)
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>IP Port Scanner</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        .container { max-width: 800px; margin: auto; }
-        input, button { padding: 8px; margin: 5px; }
-        table { border-collapse: collapse; width: 100%; margin-top: 20px; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        th { background-color: #f2f2f2; }
-        .open { color: green; font-weight: bold; }
-        .closed { color: gray; }
-        #exportBtn { display: none; margin-top: 10px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>IP Port Scanner</h1>
-        <div>
-            <label>Target IP:</label>
-            <input type="text" id="ip" placeholder="e.g., 127.0.0.1" value="127.0.0.1">
-            <label>Port Range:</label>
-            <input type="number" id="startPort" value="1" min="1" max="65535">
-            <span>to</span>
-            <input type="number" id="endPort" value="1024" min="1" max="65535">
-            <button onclick="startScan()">Scan</button>
-        </div>
-        <div id="status"></div>
-        <table id="resultsTable">
-            <thead>
-                <tr><th>Port</th><th>Status</th><th>Service</th></tr>
-            </thead>
-            <tbody></tbody>
-        </table>
-        <button id="exportBtn" onclick="exportCSV()">Export Results</button>
-    </div>
-
-    <script>
-        let scanResults = [];
-
-        async function startScan() {
-            const ip = document.getElementById('ip').value.trim();
-            const startPort = parseInt(document.getElementById('startPort').value);
-            const endPort = parseInt(document.getElementById('endPort').value);
-            const statusDiv = document.getElementById('status');
-            const tableBody = document.querySelector('#resultsTable tbody');
-            const exportBtn = document.getElementById('exportBtn');
-
-            if (!ip || isNaN(startPort) || isNaN(endPort) || startPort > endPort) {
-                statusDiv.textContent = 'Please enter valid IP and port range.';
-                return;
-            }
-
-            statusDiv.textContent = 'Scanning... This may take a moment.';
-            tableBody.innerHTML = '';
-            exportBtn.style.display = 'none';
-            scanResults = [];
-
-            try {
-                const response = await fetch('/scan', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ ip, start_port: startPort, end_port: endPort })
-                });
-                const data = await response.json();
-                if (data.error) { 
-                    statusDiv.textContent = 'Error: ' + data.error;
-                    return;
-                }
-                scanResults = data.results;
-                displayResults(scanResults);
-                statusDiv.textContent = `Scan complete. ${scanResults.filter(r => r.status === 'Open').length} open ports found.`;
-                exportBtn.style.display = 'inline-block';
-            } catch (err) {
-                statusDiv.textContent = 'Failed to scan: ' + err.message;
-            }
-        }
-
-        function displayResults(results) {
-            const tableBody = document.querySelector('#resultsTable tbody');
-            tableBody.innerHTML = '';
-            results.forEach(result => {
-                const row = document.createElement('tr');
-                row.innerHTML = `
-                    <td>${result.port}</td>
-                    <td class="${result.status.toLowerCase()}">${result.status}</td>
-                    <td>${result.service || ''}</td>
-                `;
-                tableBody.appendChild(row);
-            });
-        }
-
-        function exportCSV() {
-            if (scanResults.length === 0) return;
-            let csv = 'Port,Status,Service\\n';
-            scanResults.forEach(r => {
-                csv += `${r.port},${r.status},${r.service || ''}\\n`;
-            });
-            const blob = new Blob([csv], { type: 'text/csv' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'scan_results.csv';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-        }
-    </script>
-</body>
-</html>
-'''
-
-if __name__ == '__main__':
-    app.run(debug=True, host='127.0.0.1', port=5000)
+if __name__ == "__main__":
+    main()

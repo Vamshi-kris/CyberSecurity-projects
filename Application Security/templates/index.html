@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Application Security Demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: #0f172a; color: #e2e8f0; min-height: 100vh;
+  }
+  header {
+    background: #1e293b; padding: 1rem 2rem;
+    display: flex; justify-content: space-between; align-items: center;
+    border-bottom: 2px solid #334155; flex-wrap: wrap; gap: .5rem;
+  }
+  header h1 { font-size: 1.2rem; }
+  #auth-status { font-size: .9rem; color: #94a3b8; }
+  #auth-status .who { color: #4ade80; font-weight: 600; }
+  nav { display: flex; gap: .5rem; padding: 1rem 2rem 0; flex-wrap: wrap; }
+  .tab {
+    background: #1e293b; color: #94a3b8; border: 1px solid #334155;
+    padding: .6rem 1.4rem; border-radius: 8px 8px 0 0; cursor: pointer;
+    font-size: .95rem;
+  }
+  .tab.active { background: #334155; color: #fff; border-bottom-color: transparent; }
+  main { padding: 0 2rem 2rem; max-width: 900px; }
+  .panel { display: none; background: #1e293b; border: 1px solid #334155;
+           border-radius: 0 10px 10px 10px; padding: 1.5rem; }
+  .panel.active { display: block; }
+  .panel h2 { font-size: 1.05rem; margin-bottom: 1rem; color: #7dd3fc; }
+  label { display: block; font-size: .85rem; color: #94a3b8; margin: .8rem 0 .3rem; }
+  input {
+    width: 100%; max-width: 340px; padding: .55rem .7rem; border-radius: 6px;
+    border: 1px solid #475569; background: #0f172a; color: #e2e8f0; font-size: .95rem;
+  }
+  button.action {
+    margin-top: 1rem; padding: .55rem 1.4rem; border: none; border-radius: 6px;
+    background: #2563eb; color: #fff; font-size: .95rem; cursor: pointer;
+  }
+  button.action:hover { background: #1d4ed8; }
+  button.action.danger { background: #b91c1c; }
+  button.action.gray { background: #475569; }
+  #pwd-checks { list-style: none; margin-top: .6rem; font-size: .8rem; }
+  #pwd-checks li { color: #64748b; }
+  #pwd-checks li.ok { color: #4ade80; }
+  #pwd-checks li.ok::before { content: "✔ "; }
+  #pwd-checks li:not(.ok)::before { content: "✘ "; }
+  .hint { font-size: .8rem; color: #64748b; margin-top: .8rem; }
+  table { border-collapse: collapse; margin-top: 1rem; width: 100%; }
+  th, td { border: 1px solid #334155; padding: .45rem .8rem; font-size: .9rem; text-align: left; }
+  th { background: #0f172a; }
+  .badge { padding: .15rem .6rem; border-radius: 99px; font-size: .75rem; }
+  .badge.admin { background: #7c2d12; color: #fdba74; }
+  .badge.user  { background: #164e63; color: #67e8f9; }
+  .result { margin-top: 1rem; padding: .8rem; border-radius: 6px;
+            font-size: .88rem; white-space: pre-wrap; word-break: break-all; display: none; }
+  .result.ok  { background: #052e16; border: 1px solid #166534; color: #86efac; }
+  .result.err { background: #450a0a; border: 1px solid #991b1b; color: #fca5a5; }
+  #console { margin: 0 2rem 2rem; }
+  #console h3 { font-size: .95rem; color: #94a3b8; margin-bottom: .5rem; }
+  #log { background: #020617; border: 1px solid #334155; border-radius: 8px;
+         padding: .8rem; max-height: 220px; overflow-y: auto;
+         font-family: Consolas, monospace; font-size: .78rem; }
+  .log-entry { padding: .15rem 0; border-bottom: 1px solid #1e293b; }
+  .log-entry.ok  { color: #4ade80; }
+  .log-entry.err { color: #f87171; }
+  .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+  .row input { max-width: 240px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🔐 Application Security Demo</h1>
+  <div id="auth-status">Not logged in</div>
+</header>
+
+<nav>
+  <button class="tab active" data-tab="register">Register</button>
+  <button class="tab" data-tab="login">Login</button>
+  <button class="tab" data-tab="profile">Profile</button>
+  <button class="tab" data-tab="admin">Admin</button>
+</nav>
+
+<main>
+  <!-- REGISTER -->
+  <section id="tab-register" class="panel active">
+    <h2>Create Account</h2>
+    <label>Username (3–20 chars: letters, numbers, _ -)</label>
+    <input id="reg-username" maxlength="20" autocomplete="off">
+    <label>Password</label>
+    <input id="reg-password" type="password">
+    <ul id="pwd-checks">
+      <li data-k="len">8–72 characters</li>
+      <li data-k="upper">Uppercase letter</li>
+      <li data-k="lower">Lowercase letter</li>
+      <li data-k="digit">Digit</li>
+      <li data-k="special">Special character</li>
+    </ul>
+    <button class="action" onclick="doRegister()">Register</button>
+    <div class="result" id="reg-result"></div>
+    <p class="hint">Note: there is no role field. The server ignores any role sent by the
+       client — privilege escalation is prevented server-side (defence in depth).</p>
+  </section>
+
+  <!-- LOGIN -->
+  <section id="tab-login" class="panel">
+    <h2>Login</h2>
+    <label>Username</label>
+    <input id="login-username" autocomplete="off">
+    <label>Password</label>
+    <input id="login-password" type="password">
+    <div class="row">
+      <button class="action" onclick="doLogin()">Login</button>
+      <button class="action danger" onclick="doLogout()">Logout</button>
+    </div>
+    <div class="result" id="login-result"></div>
+    <p class="hint">The JWT is kept only in this page's memory (a JavaScript variable) —
+       never in localStorage, which injected scripts could steal via XSS.</p>
+  </section>
+
+  <!-- PROFILE -->
+  <section id="tab-profile" class="panel">
+    <h2>Your Profile (requires valid JWT)</h2>
+    <button class="action" onclick="loadProfile()">Load Profile</button>
+    <button class="action gray" onclick="loadProfileExpired()">Simulate Invalid Token</button>
+    <div class="result" id="profile-result"></div>
+    <p class="hint">"Simulate Invalid Token" corrupts the JWT so you can see the server
+       reject it with 401 — authentication is always verified server-side.</p>
+  </section>
+
+  <!-- ADMIN -->
+  <section id="tab-admin" class="panel">
+    <h2>Admin Panel (role: admin required)</h2>
+    <div class="row">
+      <button class="action" onclick="loadUsers()">Load All Users</button>
+    </div>
+    <div class="row" style="margin-top:1rem;">
+      <input id="promote-username" placeholder="username to promote" autocomplete="off">
+      <button class="action" onclick="doPromote()">Promote to Admin</button>
+    </div>
+    <table id="users-table" style="display:none;">
+      <thead><tr><th>ID</th><th>Username</th><th>Role</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="result" id="admin-result"></div>
+    <p class="hint">Try "Load All Users" as a normal user — the server returns 403.
+       Hiding the tab would be cosmetic only; authorization is enforced on the server.</p>
+  </section>
+</main>
+
+<section id="console">
+  <h3>API Console (live request log)</h3>
+  <div id="log"></div>
+</section>
+
+<script>
+/* ============================================================
+   SECURITY NOTE (worth mentioning in your presentation):
+   - The JWT lives in a JS variable (memory) only — page refresh
+     clears it. Not localStorage/sessionStorage (XSS theft risk).
+   - User data is rendered with textContent, never innerHTML,
+     to prevent stored XSS from user-controlled values.
+   - The UI never decides access — the server does (401/403).
+   ============================================================ */
+
+let token = null;        // JWT in memory only
+let currentUser = null;
+
+const $ = (id) => document.getElementById(id);
+
+/* ---------- tab switching ---------- */
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    $('tab-' + btn.dataset.tab).classList.add('active');
+  });
+});
+
+/* ---------- live password policy checklist ---------- */
+ $('reg-password').addEventListener('input', (e) => {
+  const v = e.target.value;
+  const checks = {
+    len:     v.length >= 8 && v.length <= 72,
+    upper:   /[A-Z]/.test(v),
+    lower:   /[a-z]/.test(v),
+    digit:   /[0-9]/.test(v),
+    special: /[\W_]/.test(v)
+  };
+  document.querySelectorAll('#pwd-checks li').forEach(li =>
+    li.classList.toggle('ok', checks[li.dataset.k]));
+});
+
+/* ---------- shared API helper ---------- */
+async function api(method, url, body, needsAuth) {
+  const headers = { 'Content-Type': 'application/json' };
+  let hadAuth = false;
+  if (needsAuth && token) {
+    headers['Authorization'] = 'Bearer ' + token;
+    hadAuth = true;
+  }
+  try {
+    const res = await fetch(url, {
+      method, headers,
+      body: body ? JSON.stringify(body) : undefined
+    });
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    logRequest(method, url, res.status, hadAuth, data);
+
+    // Expired/invalid token -> clear session state automatically
+    if (res.status === 401 && needsAuth) doLogout(false);
+
+    return { status: res.status, data };
+  } catch (err) {
+    logRequest(method, url, 0, hadAuth, { error: String(err) });
+    return { status: 0, data: { error: 'Network error' } };
+  }
+}
+
+function showResult(id, ok, text) {
+  const el = $(id);
+  el.className = 'result ' + (ok ? 'ok' : 'err');
+  el.style.display = 'block';
+  el.textContent = (ok ? '✓ ' : '✗ ') + text;
+}
+
+function logRequest(method, url, status, hadAuth, data) {
+  const entry = document.createElement('div');
+  entry.className = 'log-entry ' + (status > 0 && status < 400 ? 'ok' : 'err');
+  const time = new Date().toLocaleTimeString();
+  entry.textContent =
+    `[${time}] ${method} ${url} → ${status || 'NETWORK ERROR'}` +
+    (hadAuth ? '  [Bearer ✓]' : '  [no auth]') +
+    (data ? '  ' + JSON.stringify(data) : '');
+  $('log').prepend(entry);
+}
+
+/* ---------- auth status header ---------- */
+function updateStatus() {
+  $('auth-status').innerHTML = token
+    ? `Logged in as <span class="who"></span> (${currentUser.role})`
+    : 'Not logged in';
+  if (token) {
+    // textContent, not innerHTML — XSS-safe rendering of user data
+    $('auth-status').querySelector('.who').textContent = currentUser.sub;
+  }
+}
+
+/* ---------- actions ---------- */
+async function doRegister() {
+  const username = $('reg-username').value.trim();
+  const password = $('reg-password').value;
+  const r = await api('POST', '/api/register', { username, password }, false);
+  showResult('reg-result', r.status === 201,
+    r.status === 201 ? 'Registered! You can now log in.'
+                     : (r.data && r.data.error) || `HTTP ${r.status}`);
+}
+
+async function doLogin() {
+  const username = $('login-username').value.trim();
+  const password = $('login-password').value;
+  const r = await api('POST', '/api/login', { username, password }, false);
+  if (r.status === 200 && r.data && r.data.token) {
+    token = r.data.token;
+    // Decode payload (middle segment) just to display who we are —
+    // the SERVER still validates the signature on every request.
+    currentUser = JSON.parse(atob(token.split('.')[1]));
+    updateStatus();
+    showResult('login-result', true, 'Login successful. JWT received.');
+    document.querySelector('[data-tab="profile"]').click();
+  } else {
+    showResult('login-result', false, (r.data && r.data.error) || `HTTP ${r.status}`);
+  }
+}
+
+function doLogout(notify = true) {
+  token = null;
+  currentUser = null;
+  updateStatus();
+  if (notify) showResult('login-result', true, 'Logged out. Token discarded from memory.');
+}
+
+async function loadProfile() {
+  if (!token) return showResult('profile-result', false, 'Not logged in.');
+  const r = await api('GET', '/api/profile', null, true);
+  showResult('profile-result', r.status === 200,
+    r.status === 200 ? JSON.stringify(r.data, null, 2)
+                     : (r.data && r.data.error) || `HTTP ${r.status}`);
+}
+
+async function loadProfileExpired() {
+  if (!token) return showResult('profile-result', false, 'Not logged in.');
+  const saved = token;
+  token = saved.slice(0, -4) + 'XXXX';   // corrupt the signature
+  await loadProfile();
+  token = saved;                          // restore
+}
+
+async function loadUsers() {
+  if (!token) return showResult('admin-result', false, 'Not logged in.');
+  const r = await api('GET', '/api/admin/users', null, true);
+  if (r.status === 200 && Array.isArray(r.data)) {
+    const tbody = document.querySelector('#users-table tbody');
+    tbody.textContent = '';
+    r.data.forEach(u => {
+      const tr = document.createElement('tr');
+      [u.id, u.username].forEach(v => {
+        const td = document.createElement('td');
+        td.textContent = v;              // XSS-safe
+        tr.appendChild(td);
+      });
+      const td = document.createElement('td');
+      const span = document.createElement('span');
+      span.className = 'badge ' + u.role;
+      span.textContent = u.role;
+      td.appendChild(span);
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    });
+    $('users-table').style.display = 'table';
+    showResult('admin-result', true, `${r.data.length} user(s) loaded.`);
+  } else {
+    showResult('admin-result', false, (r.data && r.data.error) || `HTTP ${r.status}`);
+  }
+}
+
+async function doPromote() {
+  if (!token) return showResult('admin-result', false, 'Not logged in.');
+  const username = $('promote-username').value.trim();
+  if (!username) return showResult('admin-result', false, 'Enter a username first.');
+  const r = await api('POST', '/api/admin/promote', { username }, true);
+  showResult('admin-result', r.status === 200,
+    r.status === 200 ? r.data.message : (r.data && r.data.error) || `HTTP ${r.status}`);
+  if (r.status === 200) loadUsers();
+}
+
+updateStatus();
+</script>
+</body>
+</html>
